@@ -1,13 +1,18 @@
-FROM nvidia/cudagl:11.4.2-devel-ubuntu20.04
+FROM python:3.10-slim
 
-RUN apt-get update && apt-get install -y \
-    python3 python3-pip python3-dev \
+# Install minimal system dependencies for OpenGL (headless or hardware)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-dev libglu1-mesa-dev \
-    libxrender1 libsm6 libxext6
+    libgl1-mesa-dri libosmesa6 \
+    libxrender1 libsm6 libxext6 \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install moderngl moderngl-window Pillow pyrr flask
+# Install Python dependencies
+RUN pip install --no-cache-dir moderngl Pillow pyrr flask
 
+# App setup
 WORKDIR /app
 COPY render.py .
 
-CMD ["python3", "render.py"]
+# Run the app
+CMD ["python", "render.py"]
