@@ -3,11 +3,9 @@
 
 ### Not hooked up to Coordinator yet
 
-#### Local version
-    docker build -t yaboring-renderer ./local
-    docker run -p 5000:5000 --name yaboring-renderer yaboring-renderer
+#### Requirements
+- Rust
+- cargo
 
-#### Paperspace "ML-in-a-box" version
-
-    sudo docker build -t yaboring-renderer .
-    sudo docker run --gpus all -p 5000:5000 yaboring-renderer
+#### Running
+    cargo run --release
