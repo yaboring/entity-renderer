@@ -1,17 +1,21 @@
-use std::{convert::Infallible, sync::Arc, time::{Duration, Instant}};
-use futures_intrusive::channel::shared::oneshot_channel;
-use hyper::{Body, Response, Server, Request, header};
-use hyper::service::{make_service_fn, service_fn};
-use image::{ImageBuffer, DynamicImage, Rgba};
-use imageproc::drawing::draw_text_mut;
 use ab_glyph::{FontRef, PxScale};
+use async_stream::stream;
+use bytes::Bytes;
+use cgmath::{Deg, Matrix4, Point3, SquareMatrix, Vector3, perspective};
+use futures_intrusive::channel::shared::oneshot_channel;
+use hyper::service::{make_service_fn, service_fn};
+use hyper::{Body, Request, Response, Server, header};
 use image::codecs::jpeg::JpegEncoder;
+use image::{DynamicImage, ImageBuffer, Rgba};
+use imageproc::drawing::draw_text_mut;
 use std::io::Cursor;
+use std::{
+    convert::Infallible,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::RwLock;
 use wgpu::{Backends, InstanceDescriptor, TextureFormat, util::DeviceExt};
-use bytes::Bytes;
-use async_stream::stream;
-use cgmath::{Matrix4, Point3, Vector3, Deg, perspective, SquareMatrix};
 
 #[tokio::main]
 async fn main() {
@@ -26,16 +30,21 @@ async fn main() {
             gles_minor_version: wgpu::Gles3MinorVersion::Automatic,
         });
 
-        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }).await.expect("No suitable GPU adapters found");
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .expect("No suitable GPU adapters found");
 
         println!("Using adapter: {:?}", adapter.get_info());
 
-        let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default(), None)
-            .await.expect("Failed to create device");
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default(), None)
+            .await
+            .expect("Failed to create device");
 
         let size = wgpu::Extent3d {
             width: 256,
@@ -66,23 +75,43 @@ async fn main() {
         }
 
         let vertices = [
-            Vertex { position: [-1.0, -1.0,  1.0], color: [1.0, 0.0, 0.0] },
-            Vertex { position: [ 1.0, -1.0,  1.0], color: [0.0, 1.0, 0.0] },
-            Vertex { position: [ 1.0,  1.0,  1.0], color: [0.0, 0.0, 1.0] },
-            Vertex { position: [-1.0,  1.0,  1.0], color: [1.0, 1.0, 0.0] },
-            Vertex { position: [-1.0, -1.0, -1.0], color: [1.0, 0.0, 1.0] },
-            Vertex { position: [ 1.0, -1.0, -1.0], color: [0.0, 1.0, 1.0] },
-            Vertex { position: [ 1.0,  1.0, -1.0], color: [1.0, 1.0, 1.0] },
-            Vertex { position: [-1.0,  1.0, -1.0], color: [0.0, 0.0, 0.0] },
+            Vertex {
+                position: [-1.0, -1.0, 1.0],
+                color: [1.0, 0.0, 0.0],
+            },
+            Vertex {
+                position: [1.0, -1.0, 1.0],
+                color: [0.0, 1.0, 0.0],
+            },
+            Vertex {
+                position: [1.0, 1.0, 1.0],
+                color: [0.0, 0.0, 1.0],
+            },
+            Vertex {
+                position: [-1.0, 1.0, 1.0],
+                color: [1.0, 1.0, 0.0],
+            },
+            Vertex {
+                position: [-1.0, -1.0, -1.0],
+                color: [1.0, 0.0, 1.0],
+            },
+            Vertex {
+                position: [1.0, -1.0, -1.0],
+                color: [0.0, 1.0, 1.0],
+            },
+            Vertex {
+                position: [1.0, 1.0, -1.0],
+                color: [1.0, 1.0, 1.0],
+            },
+            Vertex {
+                position: [-1.0, 1.0, -1.0],
+                color: [0.0, 0.0, 0.0],
+            },
         ];
 
         let indices: &[u16] = &[
-            0, 1, 2,  2, 3, 0,
-            1, 5, 6,  6, 2, 1,
-            5, 4, 7,  7, 6, 5,
-            4, 0, 3,  3, 7, 4,
-            3, 2, 6,  6, 7, 3,
-            4, 5, 1,  1, 0, 4,
+            0, 1, 2, 2, 3, 0, 1, 5, 6, 6, 2, 1, 5, 4, 7, 7, 6, 5, 4, 0, 3, 3, 7, 4, 3, 2, 6, 6, 7,
+            3, 4, 5, 1, 1, 0, 4,
         ];
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -102,12 +131,14 @@ async fn main() {
         #[repr(C)]
         #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
         struct Uniforms {
-            mvp: [[f32;4];4],
+            mvp: [[f32; 4]; 4],
         }
 
         impl Uniforms {
             fn new() -> Self {
-                Self { mvp: Matrix4::identity().into() }
+                Self {
+                    mvp: Matrix4::identity().into(),
+                }
             }
 
             fn update(&mut self, rotation: f32) {
@@ -131,19 +162,20 @@ async fn main() {
             mapped_at_creation: false,
         });
 
-        let uniform_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Uniform Bind Group Layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
+        let uniform_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Uniform Bind Group Layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
 
         let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Uniform Bind Group"),
@@ -276,7 +308,7 @@ async fn main() {
         loop {
             frame_count += 1;
             let now = Instant::now();
-            
+
             // Update FPS counter
             let elapsed_since_last_check = now.duration_since(last_fps_check);
             if elapsed_since_last_check >= fps_interval {
@@ -301,7 +333,12 @@ async fn main() {
                         view: &view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.1, g: 0.2, b: 0.3, a: 1.0 }),
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.1,
+                                g: 0.2,
+                                b: 0.3,
+                                a: 1.0,
+                            }),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -363,22 +400,20 @@ async fn main() {
             drop(data);
             output_buffer.unmap();
 
-            let mut img = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(
-                size.width,
-                size.height,
-                rgba.to_vec()
-            ).unwrap();
+            let mut img =
+                ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(size.width, size.height, rgba.to_vec())
+                    .unwrap();
 
             // Draw FPS counter
             let fps_text = format!("FPS: {:.1}", fps);
             draw_text_mut(
                 &mut img,
                 Rgba([255u8, 255u8, 255u8, 255u8]), // White text
-                10, // x
-                10, // y
+                10,                                 // x
+                10,                                 // y
                 scale,
                 &font,
-                &fps_text
+                &fps_text,
             );
 
             // Convert back to RGB for JPEG encoding
@@ -394,7 +429,9 @@ async fn main() {
             {
                 let mut cursor = Cursor::new(&mut jpeg_data);
                 let mut encoder = JpegEncoder::new_with_quality(&mut cursor, 80);
-                encoder.encode_image(&DynamicImage::ImageRgb8(buffer)).unwrap();
+                encoder
+                    .encode_image(&DynamicImage::ImageRgb8(buffer))
+                    .unwrap();
             }
 
             *stream_clone.write().await = jpeg_data;
@@ -424,8 +461,12 @@ async fn main() {
                     };
 
                     let mut resp = Response::new(Body::wrap_stream(stream));
-                    resp.headers_mut().insert(header::CONTENT_TYPE,
-                        header::HeaderValue::from_static("multipart/x-mixed-replace; boundary=frame"));
+                    resp.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        header::HeaderValue::from_static(
+                            "multipart/x-mixed-replace; boundary=frame",
+                        ),
+                    );
                     Ok::<_, Infallible>(resp)
                 }
             }))
