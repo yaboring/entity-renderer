@@ -11,16 +11,22 @@ use imageproc::drawing::draw_text_mut;
 use std::io::Cursor;
 use std::{
     convert::Infallible,
-    sync::Arc,
+    sync::{Arc, atomic::{AtomicU64, Ordering}},
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
+use tokio::sync::Notify;
 use wgpu::{Backends, InstanceDescriptor, TextureFormat, util::DeviceExt};
 
 #[tokio::main]
 async fn main() {
+        use std::collections::VecDeque;
     let latest = Arc::new(RwLock::new(Vec::new()));
+    let frame_version = Arc::new(AtomicU64::new(0));
+    let notify = Arc::new(Notify::new());
     let stream_clone = latest.clone();
+    let version_clone = frame_version.clone();
+    let notify_clone = notify.clone();
 
     tokio::spawn(async move {
         let instance = wgpu::Instance::new(InstanceDescriptor {
@@ -305,6 +311,27 @@ async fn main() {
         let font = FontRef::try_from_slice(font_data).expect("Error constructing Font");
         let scale = PxScale::from(24.0);
 
+        // N-buffering: create N output buffers up front
+        const NUM_BUFFERS: usize = 3;
+        let buffer_size = (size.width * size.height * 4) as u64;
+        let output_buffers: Vec<wgpu::Buffer> = (0..NUM_BUFFERS)
+            .map(|i| device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("Output Buffer {}", i)),
+                size: buffer_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }))
+            .collect();
+        let mut buffer_index = 0;
+
+        // Track pending readbacks: (buffer_index, oneshot receiver)
+        let mut pending: VecDeque<(usize, futures_intrusive::channel::shared::OneshotReceiver<Result<(), wgpu::BufferAsyncError>>)> = VecDeque::new();
+
+        // Reusable buffers to minimize allocations
+        let mut rgba = Vec::with_capacity((size.width * size.height * 4) as usize);
+        let mut rgb = Vec::with_capacity((size.width * size.height * 3) as usize);
+        let mut jpeg_data = Vec::with_capacity((size.width * size.height * 3) as usize); // Over-allocate for safety
+
         loop {
             frame_count += 1;
             let now = Instant::now();
@@ -322,10 +349,42 @@ async fn main() {
             uniforms.update(elapsed);
             queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
+            // If all buffers are pending, wait for the oldest to complete
+            if pending.len() == NUM_BUFFERS {
+                let (idx, rx) = pending.pop_front().unwrap();
+                rx.receive().await.unwrap().unwrap();
+                // Process completed buffer
+                let output_buffer = &output_buffers[idx];
+                let data = output_buffer.slice(..).get_mapped_range();
+                rgba.clear();
+                rgba.extend_from_slice(&data);
+                drop(data);
+                output_buffer.unmap();
+
+                let mut img = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(size.width, size.height, rgba.clone()).unwrap();
+                let fps_text = format!("FPS: {:.1}", fps);
+                draw_text_mut(&mut img, Rgba([255u8, 255u8, 255u8, 255u8]), 10, 10, scale, &font, &fps_text);
+                rgb.clear();
+                for chunk in img.as_raw().chunks_exact(4) {
+                    rgb.extend_from_slice(&chunk[0..3]);
+                }
+                let buffer = ImageBuffer::from_raw(size.width, size.height, rgb.clone()).unwrap();
+                jpeg_data.clear();
+                {
+                    let mut cursor = Cursor::new(&mut jpeg_data);
+                    let mut encoder = JpegEncoder::new_with_quality(&mut cursor, 80);
+                    encoder.encode_image(&DynamicImage::ImageRgb8(buffer)).unwrap();
+                }
+                *stream_clone.write().await = jpeg_data.clone();
+                version_clone.fetch_add(1, Ordering::SeqCst);
+                notify_clone.notify_waiters();
+            }
+
+            // Render into the next available buffer
+            let output_buffer = &output_buffers[buffer_index];
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Render Encoder"),
             });
-
             {
                 let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Render Pass"),
@@ -353,22 +412,12 @@ async fn main() {
                     occlusion_query_set: None,
                     timestamp_writes: None,
                 });
-
                 render_pass.set_pipeline(&render_pipeline);
                 render_pass.set_bind_group(0, &uniform_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
                 render_pass.draw_indexed(0..num_indices, 0, 0..1);
             }
-
-            let buffer_size = (size.width * size.height * 4) as u64;
-            let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Output Buffer"),
-                size: buffer_size,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-
             encoder.copy_texture_to_buffer(
                 wgpu::ImageCopyTexture {
                     texture: &texture,
@@ -377,7 +426,7 @@ async fn main() {
                     aspect: wgpu::TextureAspect::All,
                 },
                 wgpu::ImageCopyBuffer {
-                    buffer: &output_buffer,
+                    buffer: output_buffer,
                     layout: wgpu::ImageDataLayout {
                         offset: 0,
                         bytes_per_row: Some(4 * size.width),
@@ -386,66 +435,37 @@ async fn main() {
                 },
                 size,
             );
-
             queue.submit(Some(encoder.finish()));
 
+            // Start async readback for this buffer
             let buffer_slice = output_buffer.slice(..);
             let (tx, rx) = oneshot_channel();
             buffer_slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
-            device.poll(wgpu::Maintain::Wait);
-            rx.receive().await.unwrap().unwrap();
+            pending.push_back((buffer_index, rx));
 
-            let data = buffer_slice.get_mapped_range();
-            let rgba = data.to_vec();
-            drop(data);
-            output_buffer.unmap();
-
-            let mut img =
-                ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(size.width, size.height, rgba.to_vec())
-                    .unwrap();
-
-            // Draw FPS counter
-            let fps_text = format!("FPS: {:.1}", fps);
-            draw_text_mut(
-                &mut img,
-                Rgba([255u8, 255u8, 255u8, 255u8]), // White text
-                10,                                 // x
-                10,                                 // y
-                scale,
-                &font,
-                &fps_text,
-            );
-
-            // Convert back to RGB for JPEG encoding
-            let mut rgb = Vec::with_capacity((size.width * size.height * 3) as usize);
-            for pixel in img.pixels() {
-                rgb.push(pixel[0]);
-                rgb.push(pixel[1]);
-                rgb.push(pixel[2]);
-            }
-
-            let buffer = ImageBuffer::from_raw(size.width, size.height, rgb).unwrap();
-            let mut jpeg_data = Vec::new();
-            {
-                let mut cursor = Cursor::new(&mut jpeg_data);
-                let mut encoder = JpegEncoder::new_with_quality(&mut cursor, 80);
-                encoder
-                    .encode_image(&DynamicImage::ImageRgb8(buffer))
-                    .unwrap();
-            }
-
-            *stream_clone.write().await = jpeg_data;
+            // Alternate buffer index for next frame
+            buffer_index = (buffer_index + 1) % NUM_BUFFERS;
         }
     });
 
     let make_svc = make_service_fn(move |_| {
         let latest = latest.clone();
+        let frame_version = frame_version.clone();
+        let notify = notify.clone();
         async move {
             Ok::<_, Infallible>(service_fn(move |_req: Request<Body>| {
                 let latest = latest.clone();
+                let frame_version = frame_version.clone();
+                let notify = notify.clone();
                 async move {
                     let stream = stream! {
+                        let mut last_version = frame_version.load(Ordering::SeqCst);
                         loop {
+                            // Wait for a new frame version
+                            while frame_version.load(Ordering::SeqCst) == last_version {
+                                notify.notified().await;
+                            }
+                            last_version = frame_version.load(Ordering::SeqCst);
                             let frame = latest.read().await.clone();
                             if !frame.is_empty() {
                                 let header = format!(
@@ -455,8 +475,9 @@ async fn main() {
                                 yield Ok::<Bytes, Infallible>(Bytes::from(header));
                                 yield Ok::<Bytes, Infallible>(Bytes::from(frame));
                                 yield Ok::<Bytes, Infallible>(Bytes::from("\r\n"));
+                                // Throttle to ~120 FPS for browser smoothness
+                                tokio::time::sleep(Duration::from_millis(8)).await;
                             }
-                            // tokio::time::sleep(Duration::from_millis(33)).await;
                         }
                     };
 
